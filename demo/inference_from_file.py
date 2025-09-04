@@ -135,6 +135,25 @@ def parse_txt_script(txt_content: str) -> Tuple[List[str], List[str]]:
     return scripts, speaker_numbers
 
 
+def get_activation_transitions(text_content, model, tokenizer,
+                               layer, dimension, threshold_scale, min_gap_tokens):
+    encoded = tokenizer(text_content, return_tensors="pt")
+    input_ids = encoded["input_ids"].to(model.device)
+    with torch.no_grad():
+        outputs = model.model.language_model(input_ids=input_ids, output_hidden_states=True, return_dict=True)
+    hidden = outputs.hidden_states[layer + 1][0, :, dimension].cpu()
+    threshold = hidden.mean() + threshold_scale * hidden.std()
+    above = hidden > threshold
+    crossing_indices = ((~above[:-1]) & above[1:]).nonzero(as_tuple=True)[0] + 1
+    transitions = []
+    last_idx = -min_gap_tokens
+    for idx in crossing_indices.tolist():
+        if idx - last_idx >= min_gap_tokens:
+            transitions.append((idx, hidden[idx].item()))
+            last_idx = idx
+    return transitions
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="VibeVoice Processor TXT Input Test")
     parser.add_argument(
@@ -175,7 +194,11 @@ def parse_args():
         default=1.3,
         help="CFG (Classifier-Free Guidance) scale for generation (default: 1.3)",
     )
-    
+    parser.add_argument("--split_tracks", action="store_true")
+    parser.add_argument("--activation_layer", type=int, default=0)
+    parser.add_argument("--activation_dimension", type=int, default=609)
+    parser.add_argument("--activation_threshold_scale", type=float, default=2.0)
+    parser.add_argument("--activation_min_gap_tokens", type=int, default=20)
     return parser.parse_args()
 
 def main():
@@ -280,46 +303,70 @@ def main():
     )
     generation_time = time.time() - start_time
     print(f"Generation time: {generation_time:.2f} seconds")
-    
-    # Calculate audio duration and additional metrics
+    waveform = outputs.speech_outputs[0].cpu().squeeze()
+    output_files = []
+    if args.split_tracks:
+        print("\n--- Splitting tracks per speaker ---")
+        num_splits = len(scripts) - 1
+        content_for_detection = "\n".join(re.sub(r"^Speaker\s+\d+:\s*", "", s) for s in scripts)
+        transitions = get_activation_transitions(
+            content_for_detection, model, processor.tokenizer,
+            args.activation_layer, args.activation_dimension,
+            args.activation_threshold_scale, args.activation_min_gap_tokens
+        )
+        final_tokens = [t[0] for t in transitions[:num_splits]]
+        detection_tokens = processor.tokenizer(content_for_detection, return_tensors="pt")["input_ids"]
+        total_samples = waveform.shape[-1]
+        samples_per_token = total_samples / detection_tokens.shape[1]
+        split_points = [0] + [int(t * samples_per_token) for t in final_tokens] + [total_samples]
+        segment_data = []
+        for i in range(len(split_points) - 1):
+            seg = waveform[split_points[i]:split_points[i + 1]]
+            segment_data.append((speaker_numbers[i], seg))
+        tracks = {n: [] for n in set(speaker_numbers)}
+        for spk, seg in segment_data:
+            for k in tracks:
+                if k == spk:
+                    tracks[k].append(seg)
+                else:
+                    tracks[k].append(torch.zeros_like(seg))
+        txt_filename = os.path.splitext(os.path.basename(args.txt_path))[0]
+        for spk, pieces in tracks.items():
+            track = torch.cat(pieces)
+            out_path = os.path.join(args.output_dir, f"{txt_filename}_Speaker{spk}.wav")
+            processor.save_audio(track, output_path=out_path)
+            print(f"Saved {out_path}")
+            output_files.append(out_path)
+    else:
+        txt_filename = os.path.splitext(os.path.basename(args.txt_path))[0]
+        output_path = os.path.join(args.output_dir, f"{txt_filename}_generated.wav")
+        os.makedirs(args.output_dir, exist_ok=True)
+        processor.save_audio(
+            outputs.speech_outputs[0],  # First (and only) batch item
+            output_path=output_path,
+        )
+        print(f"Saved output to {output_path}")
+        output_files.append(output_path)
     if outputs.speech_outputs and outputs.speech_outputs[0] is not None:
-        # Assuming 24kHz sample rate (common for speech synthesis)
         sample_rate = 24000
         audio_samples = outputs.speech_outputs[0].shape[-1] if len(outputs.speech_outputs[0].shape) > 0 else len(outputs.speech_outputs[0])
         audio_duration = audio_samples / sample_rate
         rtf = generation_time / audio_duration if audio_duration > 0 else float('inf')
-        
         print(f"Generated audio duration: {audio_duration:.2f} seconds")
         print(f"RTF (Real Time Factor): {rtf:.2f}x")
     else:
         print("No audio output generated")
-    
-    # Calculate token metrics
     input_tokens = inputs['input_ids'].shape[1]  # Number of input tokens
     output_tokens = outputs.sequences.shape[1]  # Total tokens (input + generated)
     generated_tokens = output_tokens - input_tokens
-    
     print(f"Prefilling tokens: {input_tokens}")
     print(f"Generated tokens: {generated_tokens}")
     print(f"Total tokens: {output_tokens}")
-
-    # Save output
-    txt_filename = os.path.splitext(os.path.basename(args.txt_path))[0]
-    output_path = os.path.join(args.output_dir, f"{txt_filename}_generated.wav")
-    os.makedirs(args.output_dir, exist_ok=True)
-    
-    processor.save_audio(
-        outputs.speech_outputs[0],  # First (and only) batch item
-        output_path=output_path,
-    )
-    print(f"Saved output to {output_path}")
-    
-    # Print summary
     print("\n" + "="*50)
     print("GENERATION SUMMARY")
     print("="*50)
     print(f"Input file: {args.txt_path}")
-    print(f"Output file: {output_path}")
+    print(f"Output files: {output_files}")
     print(f"Speaker names: {args.speaker_names}")
     print(f"Number of unique speakers: {len(set(speaker_numbers))}")
     print(f"Number of segments: {len(scripts)}")
@@ -327,9 +374,9 @@ def main():
     print(f"Generated tokens: {generated_tokens}")
     print(f"Total tokens: {output_tokens}")
     print(f"Generation time: {generation_time:.2f} seconds")
-    print(f"Audio duration: {audio_duration:.2f} seconds")
-    print(f"RTF (Real Time Factor): {rtf:.2f}x")
-    
+    if outputs.speech_outputs and outputs.speech_outputs[0] is not None:
+        print(f"Audio duration: {audio_duration:.2f} seconds")
+        print(f"RTF (Real Time Factor): {rtf:.2f}x")
     print("="*50)
 
 if __name__ == "__main__":
